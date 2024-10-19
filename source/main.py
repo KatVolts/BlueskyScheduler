@@ -9,6 +9,9 @@ from PIL import Image
 import os
 import mimetypes
 
+import moviepy.editor as mp  # Requires moviepy library for video length check
+
+
 # File to store credentials
 CREDENTIALS_FILE = "credentials.json"
 
@@ -16,6 +19,46 @@ CREDENTIALS_FILE = "credentials.json"
 BLUESKY_SERVER = "https://bsky.social"
 BLUESKY_HANDLE = ""
 BLUESKY_PASSWORD = ""
+
+# Function to upload video using Bluesky's video-specific API endpoint
+def upload_video(access_token, filepath):
+    mime_type, _ = mimetypes.guess_type(filepath)
+
+    # Ensure it's a valid video file (Bluesky supports MP4, MOV, WEBM, and MPEG)
+    if not mime_type or not mime_type.startswith("video/"):
+        messagebox.showerror("Error", "Selected file is not a valid video. Please select a valid video file (MP4, MOV, WEBM, etc.).")
+        return None
+
+    # Check the video duration (must be under 60 seconds)
+    max_video_length = 60  # 60 seconds
+    video_length = check_video_duration(filepath)
+    if video_length > max_video_length:
+        messagebox.showerror("Error", f"Video exceeds the 60-second limit! Your video is {video_length:.2f} seconds.")
+        return None
+
+    # Check the file size (must be under 50 MB)
+    max_file_size = 50 * 1024 * 1024  # 50 MB in bytes
+    file_size = os.path.getsize(filepath)
+    if file_size > max_file_size:
+        messagebox.showerror("Error", f"File size exceeds the 50 MB limit! Your file size is {file_size / (1024 * 1024):.2f} MB.")
+        return None
+
+    upload_url = f"{BLUESKY_SERVER}/xrpc/app.bsky.video.uploadVideo"
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": mime_type
+    }
+
+    with open(filepath, 'rb') as f:
+        file_data = f.read()  # Read the entire file content as raw binary data
+
+        response = requests.post(upload_url, headers=headers, data=file_data)
+
+    if response.status_code == 200:
+        return response.json()['blob']
+    else:
+        messagebox.showerror("Error", f"Video upload failed: {response.text}")
+        return None
 
 # Function to save credentials to a local file
 def save_credentials():
@@ -54,34 +97,31 @@ def authenticate():
         messagebox.showerror("Error", f"Authentication failed: {response.text}")
         return None, None
 
-# Function to upload media (image/gif/video)
+# Function to check the video duration
+def check_video_duration(filepath):
+    video = mp.VideoFileClip(filepath)
+    duration = video.duration  # Duration in seconds
+    return duration
+
 def upload_media(access_token, filepath):
     mime_type, _ = mimetypes.guess_type(filepath)
 
-    # Ensure it's an image or gif file
-    if not mime_type or not mime_type.startswith("image/"):
-        messagebox.showerror("Error", "Selected file is not a valid image or GIF. Please select an image or animated GIF (JPEG, PNG, GIF, etc.).")
+    if not mime_type:
+        messagebox.showerror("Error", "Invalid file type. Please select an image or video.")
         return None
 
-    upload_url = f"{BLUESKY_SERVER}/xrpc/com.atproto.repo.uploadBlob"
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type": mime_type  # Set the correct MIME type (e.g., image/gif for GIFs)
-    }
+    # Handle image upload
+    if mime_type.startswith("image/"):
+        return upload_image(access_token, filepath)
 
-    with open(filepath, 'rb') as f:
-        image_data = f.read()  # Read raw image or gif data
+    # Handle video upload
+    if mime_type.startswith("video/"):
+        return upload_video(access_token, filepath)
 
-        response = requests.post(upload_url, headers=headers, data=image_data)
+    messagebox.showerror("Error", "Unsupported media format.")
+    return None
 
-    # Check for a successful response
-    if response.status_code == 200:
-        return response.json()['blob']
-    else:
-        messagebox.showerror("Error", f"Media upload failed: {response.text}")
-        return None
 
-# Function to create a post
 def post_to_bluesky(text, image_path=None, post_time=None):
     access_token, did = authenticate()
     if not access_token:
@@ -89,6 +129,7 @@ def post_to_bluesky(text, image_path=None, post_time=None):
 
     media_blob = None
     if image_path:
+        mime_type, _ = mimetypes.guess_type(image_path)
         media_blob = upload_media(access_token, image_path)
         if not media_blob:
             return
@@ -109,19 +150,23 @@ def post_to_bluesky(text, image_path=None, post_time=None):
     }
 
     if media_blob:
-        payload['record']['embed'] = {
-            "$type": "app.bsky.embed.images",
-            "images": [{
-                "image": media_blob,
-                "alt": "Post image"
-            }]
-        }
+        if mime_type.startswith("image/"):
+            payload['record']['embed'] = {
+                "$type": "app.bsky.embed.images",
+                "images": [{"image": media_blob, "alt": "Post image"}]
+            }
+        elif mime_type.startswith("video/"):
+            payload['record']['embed'] = {
+                "$type": "app.bsky.embed.video",
+                "video": [{"video": media_blob, "alt": "Post video"}]
+            }
 
     response = requests.post(create_post_url, headers=headers, json=payload)
     if response.status_code == 200:
         messagebox.showinfo("Success", "Post submitted successfully!")
     else:
         messagebox.showerror("Error", f"Failed to post: {response.text}")
+
 
 # Function to schedule the post
 def schedule_post(text, image_path, post_time):
@@ -189,11 +234,18 @@ def create_ui():
     image_path = tk.StringVar()
 
     def upload_image():
+        # Allow user to select both image and video files, showing all by default
         path = filedialog.askopenfilename(
-            title="Select Image/Video",
-            filetypes=[("Image files", "*.png *.jpg *.jpeg *.gif")]
+            title="Select Image or Video",
+            filetypes=[
+                ("Media files", "*.png *.jpg *.jpeg *.gif *.mp4 *.mov *.avi *.webm"),  # Combined filter for images and videos
+                ("Image files", "*.png *.jpg *.jpeg *.gif"),  # Separate filter for just images
+                ("Video files", "*.mp4 *.mov *.avi *.webm"),  # Separate filter for just videos
+                ("All files", "*.*")  # Option to show all files
+            ]
         )
         image_path.set(path)
+
 
     tk.Button(root, text="Upload Image/Video", command=upload_image).pack()
     tk.Label(root, textvariable=image_path).pack()
